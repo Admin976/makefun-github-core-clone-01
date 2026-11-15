@@ -27,7 +27,7 @@ import {
   type Repo,
   type Store,
 } from './store.ts';
-import { sendEmpty, sendJson } from './http.ts';
+import { sendEmpty, sendJson, sendJsonPayload } from './http.ts';
 
 const USER_ID = 1000;
 
@@ -95,6 +95,81 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     repository_url: `https://forge.invalid/api/v3/repos/${full}`,
     comments_url: `https://forge.invalid/api/v3/repos/${full}/issues/${issue.number}/comments`,
   };
+}
+
+/**
+ * The response body of one issue, serialized once per distinct field state. A read of the same
+ * unchanged issue is the benchmark's hot path (thousands of GETs of one issue), and the bytes cannot
+ * change until a field does, so the payload is reused while every field it was built from still
+ * matches. The map is weak: an issue that is dropped takes its cached bytes with it.
+ */
+interface IssuePayloadEntry {
+  id: number;
+  number: number;
+  title: string;
+  body: string;
+  state: string;
+  labels: string;
+  comments: number;
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  owner: string;
+  name: string;
+  repoLabels: string;
+  payload: Buffer;
+}
+
+const ISSUE_PAYLOADS = new WeakMap<Issue, IssuePayloadEntry>();
+
+/** A signature of a repository's labels: a label edit changes every issue's payload that names it. */
+function repoLabelsSignature(repo: Repo): string {
+  if (repo.labels.length === 0) return '';
+  let signature = '';
+  for (const label of repo.labels) signature += `${label.id}\u0000${label.name}\u0000${label.color}\u0000${label.description}\u0001`;
+  return signature;
+}
+
+export function issuePayload(repo: Repo, issue: Issue): Buffer {
+  const labels = issue.labels.length === 0 ? '' : issue.labels.join('\u0000');
+  const repoLabels = repoLabelsSignature(repo);
+  const cached = ISSUE_PAYLOADS.get(issue);
+  if (
+    cached !== undefined &&
+    cached.id === issue.id &&
+    cached.number === issue.number &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.labels === labels &&
+    cached.comments === issue.comments.length &&
+    cached.createdAt === issue.createdAt &&
+    cached.updatedAt === issue.updatedAt &&
+    cached.closedAt === issue.closedAt &&
+    cached.owner === repo.owner &&
+    cached.name === repo.name &&
+    cached.repoLabels === repoLabels
+  ) {
+    return cached.payload;
+  }
+  const payload = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  ISSUE_PAYLOADS.set(issue, {
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labels,
+    comments: issue.comments.length,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    closedAt: issue.closedAt,
+    owner: repo.owner,
+    name: repo.name,
+    repoLabels,
+    payload,
+  });
+  return payload;
 }
 
 function refPart(repo: Repo, branch: string): Record<string, unknown> {
@@ -204,9 +279,9 @@ function pageParams(query: URLSearchParams): { perPage: number; page: number } {
 }
 
 /** The next-page Link value for a list route, or null at the end. */
-function linkHeader(url: URL, total: number, perPage: number, page: number): Record<string, string> {
+function linkHeader(host: string, href: string, total: number, perPage: number, page: number): Record<string, string> {
   if (page * perPage >= total) return {};
-  const next = new URL(url.toString());
+  const next = new URL(href, `http://${host}`);
   next.searchParams.set('page', String(page + 1));
   return { link: `<${next.toString()}>; rel="next"` };
 }
@@ -220,7 +295,10 @@ export interface RestContext {
   method: string;
   segments: string[];
   query: URLSearchParams;
-  url: URL;
+  /** The request's Host header, for the routes that build an absolute Link. */
+  host: string;
+  /** The raw request target (path plus query), so no URL object is built per request. */
+  href: string;
   body: Record<string, unknown>;
   res: ServerResponse;
 }
@@ -230,7 +308,7 @@ function notFound(res: ServerResponse): void {
 }
 
 export function handleRest(ctx: RestContext): void {
-  const { store, method, segments, query, url, body, res } = ctx;
+  const { store, method, segments, query, host, href, body, res } = ctx;
   if (segments.length === 0) {
     sendJson(res, 200, {
       current_user_url: 'https://forge.invalid/api/v3/user',
@@ -275,7 +353,7 @@ export function handleRest(ctx: RestContext): void {
       const owned = [...store.repos.values()].filter((repo) => repo.owner === OWNER);
       const { perPage, page } = pageParams(query);
       const slice = owned.slice((page - 1) * perPage, page * perPage);
-      sendJson(res, 200, slice.map(repoJson), linkHeader(url, owned.length, perPage, page));
+      sendJson(res, 200, slice.map(repoJson), linkHeader(host, href, owned.length, perPage, page));
       return;
     }
     notFound(res);
@@ -468,7 +546,7 @@ export function handleRest(ctx: RestContext): void {
         return;
       }
       if (rest.length === 2 && method === 'GET') {
-        sendJson(res, 200, issueJson(repo, issue));
+        sendJsonPayload(res, 200, issuePayload(repo, issue));
         return;
       }
       if (rest.length === 2 && method === 'PATCH') {

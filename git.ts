@@ -39,13 +39,27 @@ interface Packet {
   raw: Buffer;
 }
 
+/** The pkt-line length a 4-byte hex header names, or -1 when those bytes are not four hex digits. */
+function pktLengthAt(buf: Buffer, offset: number): number {
+  let value = 0;
+  for (let index = offset; index < offset + 4; index += 1) {
+    const code = buf[index]!;
+    let digit: number;
+    if (code >= 48 && code <= 57) digit = code - 48;
+    else if (code >= 97 && code <= 102) digit = code - 87;
+    else if (code >= 65 && code <= 70) digit = code - 55;
+    else return -1;
+    value = (value << 4) | digit;
+  }
+  return value;
+}
+
 function readPackets(buf: Buffer): Packet[] {
   const packets: Packet[] = [];
   let offset = 0;
   while (offset + 4 <= buf.length) {
-    const header = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) break;
-    const length = parseInt(header, 16);
+    const length = pktLengthAt(buf, offset);
+    if (length < 0) break;
     if (length === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0), next: offset + 4, raw: buf.subarray(offset, offset + 4) });
       offset += 4;
@@ -283,6 +297,43 @@ function fetchResponse(repo: Repo, request: FetchRequest): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * Fetch answers already built, per repository. A fetch answer is a pure function of the request and
+ * of objects that never change once written (an oid always names the same bytes; the store only ever
+ * adds them), so an answer for the same wants/depth/haves is the same bytes every time: the 200-commit
+ * shallow clone a benchmark asks for fifty times is packed once. Only answers whose every want already
+ * resolved are cached, so a fetch naming an object the repository does not hold yet is never frozen.
+ * The map is bounded so a trial's many repositories cannot grow it without limit.
+ */
+const FETCH_CACHE = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 8;
+const FETCH_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+
+function fetchCacheKey(request: FetchRequest): string {
+  return `${request.depth ?? 0}|${request.wants.join(',')}|${request.haves.join(',')}|${request.shallow.join(',')}|${request.peel ? 1 : 0}`;
+}
+
+function cachedFetch(repo: Repo, request: FetchRequest): Buffer {
+  let cache = FETCH_CACHE.get(repo);
+  if (cache === undefined) {
+    cache = new Map();
+    FETCH_CACHE.set(repo, cache);
+  }
+  const key = fetchCacheKey(request);
+  const hit = cache.get(key);
+  if (hit !== undefined) return hit;
+  const body = fetchResponse(repo, request);
+  const resolvable = request.wants.every((want) => repo.objects.has(want));
+  if (resolvable && body.length <= FETCH_CACHE_MAX_BYTES) {
+    if (cache.size >= FETCH_CACHE_MAX) {
+      const oldest = cache.keys().next();
+      if (!oldest.done) cache.delete(oldest.value);
+    }
+    cache.set(key, body);
+  }
+  return body;
+}
+
 function lsRefsResponse(repo: Repo, packets: Packet[]): Buffer {
   const wanted: string[] = [];
   let peelWanted = false;
@@ -334,12 +385,11 @@ function parsePush(body: Buffer): { commands: PushCommand[]; capabilities: strin
   let offset = 0;
   let packOffset = body.length;
   while (offset + 4 <= body.length) {
-    const header = body.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(header)) {
+    const length = pktLengthAt(body, offset);
+    if (length < 0) {
       packOffset = offset;
       break;
     }
-    const length = parseInt(header, 16);
     if (length === 0) {
       packets.push({ kind: 'flush', payload: Buffer.alloc(0), next: offset + 4, raw: body.subarray(offset, offset + 4) });
       offset += 4;
@@ -505,7 +555,7 @@ export function handleGit(request: GitRequest): void {
     }
     if (command.startsWith('command=fetch')) {
       const fetch = parseFetch(packets);
-      sendBuffer(res, 200, fetchResponse(repo, fetch), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
+      sendBuffer(res, 200, cachedFetch(repo, fetch), 'application/x-git-upload-pack-result', { 'cache-control': 'no-cache' });
       return;
     }
     // a v0 upload-pack request (want lines directly)

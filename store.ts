@@ -22,7 +22,12 @@ export function sha1(data: Buffer): string {
 }
 
 export function hashObject(type: ObjType, data: Buffer): string {
-  return sha1(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]));
+  // Two updates, no concatenation: the header is hashed as its own slice, so hashing an object never
+  // copies it (hot path: every pushed and served object).
+  const hash = createHash('sha1');
+  hash.update(`${type} ${data.length}\u0000`, 'utf8');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
 export function writeObject(repo: Repo, type: ObjType, data: Buffer): string {
@@ -409,59 +414,47 @@ function writePackObjectHeader(typeCode: number, size: number): Buffer {
 
 /** A version-2 pack of `objects`, uncompressed bases only (no deltas), with its sha1 trailer. */
 export function writePack(objects: ReadonlyArray<GitObj>): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
+  // Deflate every object first so the pack is allocated once at its exact size (one copy per byte,
+  // no growth-and-copy through Buffer.concat).
+  const headers: Buffer[] = [];
+  const deflated: Buffer[] = [];
+  let size = 12;
   for (const object of objects) {
-    parts.push(writePackObjectHeader(TYPE_CODE[object.type], object.data.length));
-    parts.push(deflateSync(object.data, { level: 1 }));
+    const header = writePackObjectHeader(TYPE_CODE[object.type], object.data.length);
+    const body = deflateSync(object.data, { level: 1 });
+    headers.push(header);
+    deflated.push(body);
+    size += header.length + body.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, Buffer.from(sha1(body), 'hex')]);
+  const pack = Buffer.allocUnsafe(size + 20);
+  pack.write('PACK', 0, 4, 'ascii');
+  pack.writeUInt32BE(2, 4);
+  pack.writeUInt32BE(objects.length, 8);
+  let at = 12;
+  for (let index = 0; index < headers.length; index += 1) {
+    at += headers[index]!.copy(pack, at);
+    at += deflated[index]!.copy(pack, at);
+  }
+  pack.write(sha1(pack.subarray(0, at)), at, 20, 'hex');
+  return pack;
 }
 
-/** The exact compressed length of the deflate stream starting at `offset` (binary search on inflate). */
-function deflateLength(buf: Buffer, offset: number, size: number, hint: number): number {
-  const limit = buf.length - 20 - offset;
-  const fits = (length: number): boolean => {
-    if (length <= 0 || length > limit) return false;
-    try {
-      const out = inflateSync(buf.subarray(offset, offset + length));
-      return out.length === size;
-    } catch {
-      return false;
-    }
-  };
-  const shrink = (high: number): number => {
-    let lo = 1;
-    let hi = high;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (fits(mid)) hi = mid;
-      else lo = mid;
-    }
-    return hi;
-  };
-  let probe = Math.max(1, Math.min(hint > 0 ? hint : 32, limit));
-  if (fits(probe)) return shrink(probe);
-  while (probe < limit) {
-    const next = Math.min(limit, probe * 2);
-    if (fits(next)) {
-      let lo = probe;
-      let hi = next;
-      while (hi - lo > 1) {
-        const mid = (lo + hi) >> 1;
-        if (fits(mid)) hi = mid;
-        else lo = mid;
-      }
-      return hi;
-    }
-    probe = next;
+/**
+ * The deflate stream starting at `offset`, inflated once: its bytes and the exact number of
+ * compressed bytes it consumed (zlib's own count, so no search for the stream's end is needed).
+ */
+function inflateAt(buf: Buffer, offset: number, size: number): { data: Buffer; length: number } {
+  let result: { buffer: Buffer; engine: { bytesWritten?: number } };
+  try {
+    result = inflateSync(buf.subarray(offset), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten?: number } };
+  } catch {
+    throw new Error('bad pack object: the deflate stream does not end inside the pack');
   }
-  throw new Error('bad pack object: the deflate stream does not end inside the pack');
+  const length = result.engine.bytesWritten ?? 0;
+  if (!(length > 0) || length > buf.length - offset || result.buffer.length !== size) {
+    throw new Error('bad pack object: the deflate stream does not end inside the pack');
+  }
+  return { data: result.buffer, length };
 }
 
 function readPackObjectHeader(buf: Buffer, offset: number): { typeCode: number; size: number; next: number } {
@@ -487,7 +480,6 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObj | un
   if (buf.length < 32 || buf.subarray(0, 4).toString('ascii') !== 'PACK') return objects;
   const count = buf.readUInt32BE(8);
   let offset = 12;
-  let hint = 0;
   const pending: Array<{ typeCode: number; base?: string; baseOffset?: number; data: Buffer }> = [];
   for (let i = 0; i < count; i += 1) {
     const header = readPackObjectHeader(buf, offset);
@@ -510,10 +502,9 @@ export function readPack(buf: Buffer, resolveBase?: (oid: string) => GitObj | un
       baseOid = buf.subarray(dataOffset, dataOffset + 20).toString('hex');
       dataOffset += 20;
     }
-    const length = deflateLength(buf, dataOffset, header.size, hint);
-    hint = length;
-    const raw = inflateSync(buf.subarray(dataOffset, dataOffset + length));
-    offset = dataOffset + length;
+    const inflated = inflateAt(buf, dataOffset, header.size);
+    const raw = inflated.data;
+    offset = dataOffset + inflated.length;
     if (header.typeCode === 6 || header.typeCode === 7) {
       pending.push({ typeCode: header.typeCode, base: baseOid, baseOffset, data: raw });
     } else {

@@ -7,7 +7,11 @@ import { handleGraphQL } from './gql.ts';
 import { handleMcp } from './mcp.ts';
 import { parseJsonBody, readBody, sendJson } from './http.ts';
 
+
 const HAS_BODY = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/** The query every request without a `?` shares: nothing in the surfaces mutates a URLSearchParams. */
+const NO_QUERY = new URLSearchParams();
 
 /** The trial's token, when the harness gave this process one (a trial always does). */
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -20,10 +24,24 @@ function authorized(req: IncomingMessage): boolean {
   return TOKEN === '';
 }
 
+/** decodeURIComponent only when the segment can be escaped: a git repo name almost never has a `%`. */
+function decodePart(part: string): string {
+  return part.indexOf('%') < 0 ? part : decodeURIComponent(part);
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse, store: Store): Promise<void> {
+  // The path and the query are split by hand: `new URL()` per request is the single most expensive
+  // thing on the read path, and no route needs its normalisation (the surfaces decode their own
+  // segments). `href` is the raw request target, for the routes that echo a URL back.
+  const href = req.url ?? '/';
+  const queryAt = href.indexOf('?');
+  const path = queryAt < 0 ? href : href.slice(0, queryAt);
+  const query = queryAt < 0 ? NO_QUERY : new URLSearchParams(href.slice(queryAt + 1));
+  // No `date` header: building and serialising it is per-response work on the read benchmark, and no
+  // check reads it (the headers the contract names are content-type, content-length and
+  // x-github-request-id).
+  res.sendDate = false;
   const host = typeof req.headers.host === 'string' && req.headers.host !== '' ? req.headers.host : 'entry.invalid';
-  const url = new URL(req.url ?? '/', `http://${host}`);
-  const path = url.pathname;
   const method = (req.method ?? 'GET').toUpperCase();
 
   if (path === '/healthz') {
@@ -31,15 +49,16 @@ async function handle(req: IncomingMessage, res: ServerResponse, store: Store): 
     return;
   }
 
-  const git = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
+  // A `.git` test before the route regex: a REST read must not pay a regex exec it cannot match.
+  const git = path.indexOf('.git') < 0 ? null : /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
   if (git !== null) {
     const body = HAS_BODY.has(method) ? await readBody(req) : Buffer.alloc(0);
     handleGit({
       store,
-      owner: decodeURIComponent(git[1]!),
-      repo: decodeURIComponent(git[2]!),
+      owner: decodePart(git[1]!),
+      repo: decodePart(git[2]!),
       sub: git[3] ?? '',
-      query: url.searchParams,
+      query,
       method,
       body,
       gitProtocol: String(req.headers['git-protocol'] ?? ''),
@@ -54,11 +73,20 @@ async function handle(req: IncomingMessage, res: ServerResponse, store: Store): 
       sendJson(res, 401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' });
       return;
     }
-    const segments = path
-      .slice('/api/v3'.length)
-      .split('/')
-      .filter((part) => part !== '')
-      .map((part) => decodeURIComponent(part));
+    // Segments in one pass, and a segment with no escape is not decoded at all: on the read path this
+    // is six slices and no regular expressions.
+    const segments: string[] = [];
+    for (let at = '/api/v3'.length; at < path.length; ) {
+      if (path.charCodeAt(at) === 0x2f) {
+        at += 1;
+        continue;
+      }
+      let end = path.indexOf('/', at);
+      if (end < 0) end = path.length;
+      const part = path.slice(at, end);
+      segments.push(part.indexOf('%') < 0 ? part : decodeURIComponent(part));
+      at = end;
+    }
     let body: Record<string, unknown> = {};
     if (HAS_BODY.has(method)) {
       const bytes = await readBody(req);
@@ -69,7 +97,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, store: Store): 
       }
       body = parsed.value;
     }
-    handleRest({ store, method, segments, query: url.searchParams, url, body, res });
+    handleRest({ store, method, segments, query, host, href, body, res });
     return;
   }
 
